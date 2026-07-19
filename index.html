@@ -1520,8 +1520,10 @@ img{display:block;max-width:100%}
             <div class="field-wrap"><input class="field" id="vapid-key-input" placeholder="Your VAPID public key (optional)"></div>
             <div class="btn-row"><button class="btn premium" style="flex:1" onclick="enablePushNotifications()">Enable real push</button></div>
             <div class="btn-row"><button class="btn ghost" style="flex:1" onclick="generateVapidKeys()">Generate VAPID keys</button><button class="btn ghost" style="flex:1" onclick="downloadPushWorkerKit()">Download push worker</button></div>
+            <div class="btn-row"><button class="btn ghost" style="flex:1;background:var(--accent-soft);color:var(--accent)" onclick="downloadServiceWorker()">Download sw.js (required — see below)</button></div>
             <div class="field-wrap" style="margin-top:8px"><input class="field" id="push-worker-url-input" placeholder="https://your-push-worker.workers.dev/send"></div>
             <div class="btn-row"><button class="btn soft" style="flex:1" onclick="sendTestPush()">Send test push</button></div>
+            <div class="sub" style="font-size:11.5px;line-height:1.5;color:var(--accent)"><strong>Required first step:</strong> download sw.js above and upload it into the exact same folder as this index.html on whatever host serves Nexa (GitHub Pages, Cloudflare Pages, etc). "Enable real push" cannot work without it present at that location — it's a real limitation of how Push notifications work in browsers, not optional.</div>
             <div class="sub" style="font-size:11.5px;line-height:1.5">Reminders above fire while the app is open, at no cost. To be notified even when Nexa is fully closed, deploy the included <strong>nexa-push-worker.js</strong> (a tiny Cloudflare Worker, same pattern as the Anthropic proxy) and paste its VAPID public key here.</div>
           </div>
         </div>
@@ -2597,19 +2599,21 @@ function initOfflineSupport(){
   S.isOnline=navigator.onLine;
   window.addEventListener('online', ()=>{ S.isOnline=true; renderOfflineStatus(); toast('Back online'); flushOfflineQueue(); });
   window.addEventListener('offline', ()=>{ S.isOnline=false; renderOfflineStatus(); toast('You are offline — Nexa will keep your history and send queued messages once reconnected'); });
+  /* IMPORTANT FIX: browsers refuse to register a Service Worker from a blob: URL (a
+     security restriction — service workers must be real same-origin files, not
+     generated in memory). The earlier version of this code tried the blob: approach,
+     which silently failed every time, and made anything depending on
+     navigator.serviceWorker.ready (like push notifications) hang forever with no error.
+     This now registers a real file, sw.js, that must sit next to index.html on
+     whatever server hosts Nexa (use Settings > Notifications > "Download push worker"'s
+     sibling — the Service Worker file — described in Settings, or grab it from the
+     app's source). If sw.js isn't present (e.g. testing via a bare file:// open with no
+     server), this fails gracefully instead of hanging. */
   if('serviceWorker' in navigator){
-    try{
-      const swCode=`
-        const CACHE='nexa-shell-v1';
-        self.addEventListener('install', e=>{ self.skipWaiting(); e.waitUntil(caches.open(CACHE).then(c=>c.add(self.registration.scope))); });
-        self.addEventListener('activate', e=>self.clients.claim());
-        self.addEventListener('fetch', e=>{
-          if(e.request.method!=='GET') return;
-          e.respondWith(caches.match(e.request).then(hit=> hit || fetch(e.request).then(res=>{ const clone=res.clone(); caches.open(CACHE).then(c=>c.put(e.request, clone)); return res; }).catch(()=> hit)));
-        });`;
-      const blob=new Blob([swCode],{type:'application/javascript'});
-      navigator.serviceWorker.register(URL.createObjectURL(blob)).catch(()=>{});
-    }catch(e){}
+    navigator.serviceWorker.register('./sw.js').catch(()=>{
+      S.swUnavailable=true;
+      const el=$('set-offline-sub'); if(el) el.textContent='Offline caching & push need sw.js hosted alongside index.html — see Settings > Notifications for the file';
+    });
   }
   renderOfflineStatus();
 }
@@ -7775,6 +7779,50 @@ Both VAPID_PUBLIC_KEY and VAPID_PRIVATE_KEY are read from environment
 variables/secrets (set in the Cloudflare dashboard, or via "wrangler secret
 put") — you never need to hand-edit this file with your keys.
 `;
+const NEXA_SERVICE_WORKER_JS=`// sw.js — Nexa's Service Worker. This file MUST be hosted alongside index.html
+// (same folder, same origin) for offline caching and push notifications to work.
+// It cannot be generated in-memory (e.g. via a blob: URL) — browsers require real
+// same-origin service worker files as a security measure, so this has to be a real
+// file sitting next to index.html on whatever server/host serves Nexa (GitHub Pages,
+// Cloudflare Pages, Netlify, your own server, etc).
+const CACHE = 'nexa-shell-v1';
+self.addEventListener('install', (e) => {
+  self.skipWaiting();
+  e.waitUntil(caches.open(CACHE).then((c) => c.add(self.registration.scope)));
+});
+self.addEventListener('activate', (e) => { e.waitUntil(self.clients.claim()); });
+self.addEventListener('fetch', (e) => {
+  if (e.request.method !== 'GET') return;
+  e.respondWith(
+    caches.match(e.request).then((hit) =>
+      hit || fetch(e.request).then((res) => {
+        const clone = res.clone();
+        caches.open(CACHE).then((c) => c.put(e.request, clone));
+        return res;
+      }).catch(() => hit)
+    )
+  );
+});
+// Real push notification display — fires when your deployed nexa-push-worker sends
+// a message via the Push API, even if Nexa itself is fully closed.
+self.addEventListener('push', (e) => {
+  let data = {}; try { data = e.data ? e.data.json() : {}; } catch (err) {}
+  const title = data.title || 'Nexa';
+  const body = data.body || '';
+  e.waitUntil(self.registration.showNotification(title, { body, icon: undefined }));
+});
+self.addEventListener('notificationclick', (e) => {
+  e.notification.close();
+  e.waitUntil(self.clients.matchAll({ type: 'window' }).then((list) => {
+    for (const c of list) if ('focus' in c) return c.focus();
+    if (self.clients.openWindow) return self.clients.openWindow('./');
+  }));
+});
+`;
+async function downloadServiceWorker(){
+  downloadText('sw.js', NEXA_SERVICE_WORKER_JS, 'application/javascript;charset=utf-8');
+  toast('sw.js downloaded — upload it into the SAME folder as index.html on your host, then reload Nexa');
+}
 async function downloadPushWorkerKit(){
   toast('Packaging push worker…');
   try{
@@ -8092,15 +8140,25 @@ async function enablePushNotifications(){
   const st=$('push-status');
   if(!key){ if(st) st.textContent='Paste a VAPID public key from your push worker first'; return; }
   if(!('serviceWorker' in navigator) || !('PushManager' in window)){ if(st) st.textContent='Push isn\'t supported in this browser'; return; }
+  if(st) st.textContent='Requesting permission…';
   try{
     const ok=await ensureNotifyPermission();
     if(!ok){ if(st) st.textContent='Notification permission denied'; return; }
-    const reg=await navigator.serviceWorker.ready;
+    if(st) st.textContent='Waiting for the Service Worker…';
+    // Real fix: navigator.serviceWorker.ready hangs forever with no error if sw.js was
+    // never successfully registered (e.g. it's missing from the server, or this is a
+    // bare file:// open with no server at all). Race it against a timeout so the user
+    // gets an actual, actionable message instead of a silently frozen button.
+    const timeout=new Promise((_,rej)=>setTimeout(()=>rej(new Error('timeout')), 6000));
+    const reg=await Promise.race([navigator.serviceWorker.ready, timeout]);
     const sub=await reg.pushManager.subscribe({ userVisibleOnly:true, applicationServerKey:urlBase64ToUint8Array(key) });
     S.pushSubscription=JSON.stringify(sub); S.vapidKey=key; persist();
     if(st) st.textContent='Subscribed — your push worker can now send real notifications to this device even when closed';
     toast('Push notifications enabled');
-  }catch(e){ if(st) st.textContent='Could not subscribe — check the VAPID key and that this page is served over HTTPS'; }
+  }catch(e){
+    if(e && e.message==='timeout'){ if(st) st.textContent='sw.js (the Service Worker file) isn\'t available on this server — see the note below to add it, then reload and try again.'; }
+    else { if(st) st.textContent='Could not subscribe — check the VAPID key and that this page is served over HTTPS'; }
+  }
 }
 /* Real end-to-end test: actually POSTs your live subscription to your deployed worker's
    /send endpoint, so you can verify the whole pipeline works before relying on it. Requires
